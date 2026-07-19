@@ -1,0 +1,295 @@
+---
+title: "Atlantic Hurricane Tracks: an exploration of HURDAT2"
+author: "leon5354"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    fig_caption: yes
+    keep_tex: no
+    toc: yes
+    toc_depth: 2
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+project_root <- rprojroot::find_root(rprojroot::has_file("README.md"))
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, fig.align = "center")
+```
+
+## Introduction
+
+This report explores the NOAA **HURDAT2** Atlantic-basin hurricane dataset.
+HURDAT2 is the official best-track archive for tropical cyclones in the
+North Atlantic; the version used here covers 1851–2025 and contains roughly
+2,000 storms and 56,000 track points. Each row is a single six-hour
+observation of a storm: position, intensity, and (for landfalling points) a
+marker. We use it to answer four broad questions:
+
+1. What does the dataset look like in aggregate?
+2. What does the spatial distribution of storm tracks look like?
+3. Which storms have passed close to a chosen reference city?
+4. How have storm frequency, intensity, and season length changed over time?
+
+The analysis is an updated, cleaned-up version of a 2023 coursework project.
+A few bugs in the original draft (a latitude-bounds check that was silently
+dead code, an unvectorised distance function being called on a vector, a
+malformed loop accumulator) have been fixed; the methodology is otherwise
+unchanged.
+
+## Data
+
+Daily observations are loaded from a tidy snapshot produced by
+`data/fetch_data.R`. The script downloads the current HURDAT2 file from
+`nhc.noaa.gov`, parses the fixed-width format, and saves a tidy data frame
+called `hurrs` with one row per observation:
+
+```{r load-data}
+library(maps); library(tidyverse)
+load("data/hurdat2_tidy.RData")
+
+hurrs <- hurrs %>%
+  mutate(decade = 10 * (year %/% 10))   # used in Q4
+```
+
+```{r summary-table}
+summary_stats <- data.frame(
+  Statistic = c("Storms", "Track points", "First year", "Last year",
+                "Landfall points", "Observations with wind data"),
+  Value = c(n_distinct(hurrs$id),
+            nrow(hurrs),
+            min(hurrs$year),
+            max(hurrs$year),
+            sum(hurrs$isLandfall),
+            sum(!is.na(hurrs$windspeed)))
+)
+knitr::kable(summary_stats, col.names = c("Statistic", "Value"),
+             caption = "HURDAT2 dataset summary")
+```
+
+## Part 1: dataset summaries
+
+We can pull out, for example, the full track of Hurricane Katrina (2005):
+
+```{r katrina-rows, echo=TRUE}
+katrina <- hurrs %>% filter(id == "AL122005")
+cat(sprintf("Katrina (AL122005) track points: %d\n", nrow(katrina)))
+```
+
+A per-storm summary function is useful for describing any subset:
+
+```{r summary-fn, echo=TRUE}
+Hurdat2_summary <- function(x) {
+  list(
+    storms       = n_distinct(x$id),
+    year_span    = max(x$year) - min(x$year),
+    track_points = x %>% group_by(id) %>% summarise(points = n())
+  )
+}
+```
+
+```{r trackpoint-hist, fig.cap="Distribution of track-point counts per storm. The long right tail reflects the longest-lived storms."}
+trackpoint <- hurrs %>% group_by(id) %>% summarise(n = n())
+ggplot(trackpoint, aes(n)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "white") +
+  labs(x = "Track points per storm", y = "Number of storms") +
+  theme_minimal()
+```
+
+Storms are named from 1950 onward:
+
+```{r named-start, echo=TRUE}
+hurrs %>% filter(name != "UNNAMED") %>% arrange(year) %>% head(1) %>% select(id, name, year)
+```
+
+## Part 2: spatial visualisation
+
+A reusable basemap for the Atlantic basin, with overlay tracks coloured by
+windspeed:
+
+```{r basemap-fn, echo=TRUE}
+hurricaneBasemap <- function() {
+  world <- map_data("world")
+  ggplot() +
+    coord_fixed(xlim = c(-130, 30), ylim = c(0, 90)) +
+    geom_polygon(data = world, aes(x = long, y = lat, group = group),
+                 color = "gray50", fill = "white")
+}
+```
+
+```{r all-tracks, fig.cap="All recorded Atlantic storm tracks, coloured by windspeed. Pre-1900 storms lack wind data and appear grey.", fig.height=4.8}
+hurricaneBasemap() +
+  geom_path(data = hurrs,
+            aes(x = longitude, y = latitude, group = id, color = windspeed),
+            na.rm = TRUE, alpha = 0.6) +
+  scale_color_distiller(type = "seq", direction = 1, palette = "YlOrRd",
+                        na.value = "grey80") +
+  labs(color = "Wind (kt)") +
+  theme(legend.position = "right")
+```
+
+A single-year view (Hurricane Andrew and its peers in 1992):
+
+```{r year-1992, fig.cap="Storm tracks in 1992, coloured by windspeed."}
+hurricanes_year <- function(x) {
+  yearset <- hurrs %>% filter(year == x)
+  hurricaneBasemap() +
+    geom_path(data = yearset,
+              aes(x = longitude, y = latitude, group = id, color = windspeed),
+              na.rm = TRUE) +
+    scale_color_distiller(type = "seq", direction = 1, palette = "YlOrRd",
+                          na.value = "grey80") +
+    labs(color = "Wind (kt)")
+}
+print(hurricanes_year(1992))
+```
+
+## Part 3: storms near a reference city
+
+To make distance questions tractable we use an equirectangular approximation
+of great-circle distance. Because the function is called inside a `mutate`
+on a 56,000-row data frame, it has to be vectorised — the original draft
+called a scalar implementation on a vector and silently mis-behaved.
+
+```{r distance-fn, echo=TRUE}
+findD <- function(xx, yy, x, y) {
+  dy <- yy - y
+  dx <- (xx - x) * cos((pi / 180) * ((y + yy) / 2))
+  111.325 * sqrt(dx^2 + dy^2)
+}
+
+findD_city <- function(x, y, city) {
+  ref <- world.cities %>% filter(name == city) %>% slice(1)
+  if (nrow(ref) == 0) stop("city not found: ", city)
+  findD(ref$long, ref$lat, x, y)
+}
+
+# v2 adds a sanity check for swapped lon/lat inputs. The original draft had
+# `if (y <-90 & y> 90)` which R parses as `y <- 90; (90 > 90)` — a no-op.
+findD_city_v2 <- function(x, y, city) {
+  if (any(y < -90 | y > 90, na.rm = TRUE)) {
+    warning("Latitude outside [-90, 90]: check for swapped lon/lat.")
+  }
+  findD_city(x, y, city)
+}
+```
+
+Which storms have passed within 100 km of Port-au-Prince?
+
+```{r port-au-prince, fig.cap="Storm tracks that have passed within 100 km of Port-au-Prince.", fig.height=4.5}
+close <- hurrs %>%
+  mutate(distance_to_Prince = findD_city_v2(longitude, latitude, "Port-au-Prince"))
+real_close <- close %>% filter(distance_to_Prince <= 100)
+hurrs_prince <- hurrs %>% filter(id %in% unique(real_close$id))
+
+port <- world.cities %>% filter(name == "Port-au-Prince")
+ggplot() +
+  coord_fixed(xlim = c(-100, -25), ylim = c(0, 75)) +
+  geom_polygon(data = map_data("world"),
+               aes(x = long, y = lat, group = group),
+               color = "gray50", fill = "white") +
+  geom_path(data = hurrs_prince,
+            aes(x = longitude, y = latitude, color = id),
+            na.rm = TRUE) +
+  geom_point(data = port, aes(x = long, y = lat),
+             size = 3, shape = 23, fill = "darkred") +
+  geom_text(data = port, aes(x = long, y = lat + 2, label = name), size = 3) +
+  theme(legend.position = "none") +
+  labs(title = sprintf("Storms within 100 km of Port-au-Prince (%d storms)",
+                       n_distinct(hurrs_prince$id)))
+```
+
+## Part 4: temporal patterns
+
+### Storms per year
+
+```{r storms-per-year, fig.cap="Distinct Atlantic storms recorded per year. Reporting density is much lower before the satellite era (post-1960s)."}
+storms_per_year <- hurrs %>% group_by(year) %>% summarise(count = n_distinct(id))
+ggplot(storms_per_year, aes(year, count)) +
+  geom_line(color = "steelblue") +
+  geom_point(size = 0.7) +
+  labs(x = NULL, y = "Distinct storms") +
+  theme_minimal()
+```
+
+The steep rise in the second half of the 20th century is at least partly an
+artefact of better observation — satellites began tracking the open Atlantic
+in the 1960s, so storms that would have gone unrecorded earlier now get a
+best-track entry.
+
+### Landfall zone over time
+
+```{r landfall-zone, fig.cap="Landfall tracks coloured by year. The set of coastlines affected has expanded poleward and westward over time.", fig.height=4.5}
+landed <- hurrs %>% filter(isLandfall)
+ggplot() +
+  coord_fixed(xlim = c(min(landed$longitude), max(landed$longitude)),
+              ylim = c(min(landed$latitude),  max(landed$latitude))) +
+  geom_polygon(data = map_data("world"),
+               aes(x = long, y = lat, group = group),
+               color = "gray50", fill = "white") +
+  geom_path(data = landed,
+            aes(x = longitude, y = latitude, group = id, color = year)) +
+  scale_color_distiller(type = "div", direction = 0, palette = "RdYlBu") +
+  labs(color = "Year", title = "Landfall tracks by year") +
+  theme_minimal()
+```
+
+### Peak windspeed per year
+
+```{r peak-wind, fig.cap="Annual peak windspeed. The trend is upward, but part of the pre-1950 climb reflects the gradual filling-in of missing wind reports rather than a true physical change."}
+peak_windspeed <- hurrs %>%
+  filter(!is.na(windspeed)) %>%
+  group_by(year) %>%
+  summarise(peak = max(windspeed))
+ggplot(peak_windspeed, aes(year, peak)) +
+  geom_line(color = "firebrick") +
+  labs(x = NULL, y = "Peak windspeed (kt)") +
+  theme_minimal()
+```
+
+### Storms per month (the hurricane season)
+
+```{r storms-per-month, fig.cap="Distinct storms per calendar month. September is the peak of the Atlantic hurricane season."}
+storms_per_month <- hurrs %>% group_by(month) %>% summarise(count = n_distinct(id))
+ggplot(storms_per_month, aes(month, count)) +
+  geom_col(fill = "steelblue") +
+  scale_x_continuous(breaks = 1:12,
+                     labels = month.abb) +
+  labs(x = NULL, y = "Distinct storms") +
+  theme_minimal()
+```
+
+### Season expansion across decades
+
+Stacking each year's storms by month shows the season widening over time:
+recent decades have seen off-season storms (January, March, April) that were
+essentially absent in the 19th-century record.
+
+```{r season-stack, fig.cap="Storms per year, stacked by month. The coloured bands broaden into May and November-December over time."}
+hurrs_year_month <- hurrs %>% group_by(year, month) %>% distinct(id)
+ggplot(hurrs_year_month, aes(x = year, fill = factor(month))) +
+  geom_histogram(binwidth = 1) +
+  scale_fill_brewer(type = "div", direction = 1, palette = "PRGn") +
+  labs(x = NULL, y = "Distinct storms", fill = "Month") +
+  theme_minimal()
+```
+
+## Discussion
+
+A few takeaways:
+
+* HURDAT2 is enormous but inhomogeneous: reporting density changes sharply
+  across eras. Any trend in storm counts or peak windspeed has to be read
+  against that backdrop.
+* The Atlantic hurricane season is clearly concentrated in September, but
+  the season appears to have widened over the past several decades — more
+  storms recorded in the shoulder months of May and November-December.
+* The landfall footprint has expanded poleward and westward compared with
+  the early record. Some of that is observation; some is consistent with
+  research on poleward migration of tropical-cyclone maximum intensity.
+
+## Reproducibility
+
+Refresh the data with `Rscript data/fetch_data.R`. Re-render the report with
+`rmarkdown::render("report/hurricane-analysis.Rmd")`.
